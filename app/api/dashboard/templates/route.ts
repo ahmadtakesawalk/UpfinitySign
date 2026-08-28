@@ -32,7 +32,7 @@ export async function GET(req: NextRequest) {
       include: { _count: { select: { envelopes: true } }, folder: true },
     });
 
-    return NextResponse.json({ templates });
+    return NextResponse.json({ templates: templates.map((t: (typeof templates)[number]) => ({ ...t, pdf_url: storage.url(t.pdfStorageKey) })) });
   } catch (err) {
     await captureException(err, { context: "templates_list", tenantId: user.tenantId });
     return NextResponse.json({ error: "Couldn't load templates. Please try again." }, { status: 500 });
