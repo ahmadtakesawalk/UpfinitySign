@@ -13,6 +13,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateTenant, requireScope } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { storage } from "@/lib/storage";
+import type { EnvelopeStatus } from "@prisma/client";
 
 const PAGE_SIZE_DEFAULT = 25;
 const PAGE_SIZE_MAX = 100;
@@ -20,7 +21,11 @@ const PAGE_SIZE_MAX = 100;
 // Provider-facing status groups — collapses the underlying EnvelopeStatus
 // enum into the three buckets an integration actually wants to filter by,
 // rather than making every caller know our exact internal status names.
-const STATUS_GROUPS: Record<string, string[]> = {
+// Typed against the real Prisma enum (not a bare string[]) so a typo here
+// is a compile error, not a silent runtime mismatch — and so this compiles
+// correctly once Prisma's client is actually generated, which never
+// happened in the sandbox this file was originally written in.
+const STATUS_GROUPS: Record<string, EnvelopeStatus[]> = {
   pending: ["sent", "delivered", "opened", "signed"], // in-flight, not yet fully completed — "signed" covers a multi-recipient envelope where one has signed but others haven't
   completed: ["completed"],
   declined: ["declined"],
