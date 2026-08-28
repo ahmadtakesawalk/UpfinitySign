@@ -1,0 +1,546 @@
+// Upfinity Sign — Prisma schema
+// See PRD.md §3 for the data model rationale, §12 for the admin/RBAC model.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // Neon
+  url      = env("DATABASE_URL")
+}
+
+enum EnvelopeStatus {
+  draft
+  sent
+  delivered
+  opened
+  signed
+  completed
+  declined
+  voided
+  expired
+}
+
+enum RecipientRole {
+  signer
+  cc
+  approver
+}
+
+enum SubscriptionTier {
+  free
+  starter
+  business
+  enterprise
+}
+
+// Tenant-side roles — scoped to that tenant's own data only, never cross-tenant.
+enum TenantUserRole {
+  owner   // full control incl. billing, can manage other TenantUsers
+  admin   // manage templates/envelopes/settings, cannot manage billing or delete the tenant
+  sender  // create/send envelopes only
+  viewer  // read-only dashboard access
+}
+
+// Platform-side roles — Upfinity's own staff, kept in a SEPARATE table from
+// TenantUser on purpose (see PRD.md §12) so a bug or privilege-escalation in
+// tenant-facing code can never grant cross-tenant access.
+enum PlatformAdminRole {
+  super_admin // full platform control incl. managing other PlatformAdmins
+  support     // read tenant data + assist, cannot change tier/billing/delete
+  billing_ops // manage tiers/subscriptions, no raw tenant document access
+}
+
+model Tenant {
+  id                  String           @id @default(cuid())
+  name                String
+  slug                String           @unique
+  webhookUrl          String?
+  webhookSecret       String?
+  stripeConnectedAccountId String? // Stripe Connect account for THIS tenant's own payment collection during signing — separate from the platform's own Stripe account used for billing tenants (lib/billing/providers/stripe.ts). Money collected via payment fields goes here, never to the platform's account.
+  stripeConnectOnboarded   Boolean @default(false) // true once Stripe confirms charges_enabled on the connected account — see the account.updated handler in app/api/webhooks/stripe-connect/route.ts
+  brandingEnabled     Boolean          @default(false)
+  customLogoUrl       String?
+  customDomain        String?
+  customFromEmail          String?   // enterprise-only — envelope emails send "from" this address instead of the platform default
+  customFromEmailVerifiedAt DateTime? // set by a platform admin once domain ownership/DNS is confirmed — unset means "requested but not usable yet"
+  tier                SubscriptionTier @default(free)
+  suspended           Boolean          @default(false) // super admin kill switch — blocks API + signing without deleting data
+  suspensionReason    String? // "admin_action" | "trial_expired_no_card" | "payment_failed_dunning" | "deletion_requested" — lets admins tell a real abuse suspension apart from an automatic trial-expiry/dunning lock at a glance. See lib/billing/apply-event.ts and lib/billing/dunning.ts for where each is set.
+  trialEndsAt         DateTime? // set at signup; free tier converts automatically once this passes — see lib/billing/trial.ts
+  trialExternalCustomerId String? // the payment provider's own customer reference — "external" because this must stay provider-agnostic (currently populated by Stripe, but nothing outside lib/billing/providers/*.ts should ever need to know that). Set once a card is saved during the trial (no charge yet) — presence of this is what "card added" checks against
+  trialCardAddedAt    DateTime?
+  taxRatePercent      Float? // manually set per tenant by an admin, based on their billing jurisdiction — see ADMIN_GUIDE.md for why this isn't automatic tax-jurisdiction detection
+  consecutiveFailedPayments Int @default(0) // drives the dunning escalation in lib/billing/apply-event.ts — reset to 0 on any successful charge
+  deletionRequestedAt DateTime?        // set by an owner/super admin; purge job (not yet built, see PRD §14) acts on this after a grace period
+  createdAt           DateTime         @default(now())
+
+  templates    Template[]
+  templateFolders TemplateFolder[]
+  envelopes    Envelope[]
+  users        TenantUser[]
+  apiKeys      ApiKey[]
+  usageMeters  UsageMeter[]
+  contacts     Contact[]
+  usageCredits UsageCredit[]
+  invoices     Invoice[]
+  supportMessages SupportMessage[]
+  subscription Subscription?
+  settings     TenantSetting[]
+  ssoConfig    SsoConfig?
+}
+
+// Named, individually revocable API keys — replaces the earlier single
+// Tenant.apiKeyHash field (a single shared key can't be scoped or rotated
+// without breaking every integration at once; enterprise tenants expect
+// per-integration keys, e.g. one for Dvxel Qbank, one for a future integration).
+model ApiKey {
+  id         String    @id @default(cuid())
+  tenantId   String
+  tenant     Tenant    @relation(fields: [tenantId], references: [id])
+  name       String    // e.g. "Dvxel Qbank integration"
+  keyHash    String    @unique
+  scopes     Json      @default("[\"envelopes:write\", \"envelopes:read\"]")
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([tenantId])
+}
+
+model TenantUser {
+  id           String         @id @default(cuid())
+  tenantId     String
+  tenant       Tenant         @relation(fields: [tenantId], references: [id])
+  email        String
+  passwordHash String?        // null until the user completes first-login setup (invite flow — see PRD §14)
+  role         TenantUserRole @default(admin)
+  createdAt    DateTime       @default(now())
+
+  @@unique([tenantId, email])
+}
+
+// Upfinity's own staff. Deliberately not a TenantUser with a special role —
+// a fully separate table/session type, so tenant-scoped code paths can never
+// accidentally authenticate a platform admin as if they belonged to a tenant.
+model PlatformAdmin {
+  id           String            @id @default(cuid())
+  email        String            @unique
+  passwordHash String?           // null between being invited and setting a first password — see AdminPasswordResetToken
+  role         PlatformAdminRole @default(support)
+  createdAt    DateTime          @default(now())
+
+  auditLogs AdminAuditLog[]
+}
+
+model AdminPasswordResetToken {
+  id             String    @id @default(cuid())
+  platformAdminId String
+  tokenHash      String    @unique
+  expiresAt      DateTime
+  usedAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([platformAdminId])
+}
+
+// Every action a platform admin takes against tenant data or settings.
+// Separate from the product's own (tenant-facing) AuditEvent trail — this is
+// "who on our staff touched what", not "what happened to a signer's envelope".
+model AdminAuditLog {
+  id              String         @id @default(cuid())
+  platformAdminId String
+  platformAdmin   PlatformAdmin  @relation(fields: [platformAdminId], references: [id])
+  action          String         // e.g. "tenant.tier_changed", "tenant.suspended", "tenant.impersonated"
+  targetTenantId  String?
+  details         Json?
+  ipAddress       String?
+  timestamp       DateTime       @default(now())
+
+  @@index([targetTenantId])
+  @@index([platformAdminId])
+}
+
+// Tenant-scoped configurable settings that don't warrant their own Tenant
+// column — surfaced in the tenant admin dashboard. Key/value so new settings
+// don't require a migration each time. config.ts values remain the DEFAULT;
+// a row here overrides the default for that one tenant. See lib/settings.ts.
+model TenantSetting {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  key       String   // e.g. "retention_years", "notification_email", "reminder_hours"
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, key])
+}
+
+// Platform-wide configurable settings (feature flags, maintenance mode,
+// default tier limits) editable from the super admin dashboard instead of
+// requiring a code deploy. config.ts values remain the fallback if no row
+// exists yet — see lib/settings.ts.
+model PlatformSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique // e.g. "maintenance_mode", "tier_limits_override"
+  value     Json
+  updatedBy String?  // PlatformAdmin id
+  updatedAt DateTime @updatedAt
+}
+
+model TemplateFolder {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  name      String
+  createdAt DateTime @default(now())
+
+  templates Template[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+model Template {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  name          String
+  pdfStorageKey String   // the PRIMARY document — documentIndex 0. Unchanged by multi-document support below, so every existing single-document template/field/sign-page/burn code path keeps working with zero migration needed.
+  fieldMap      Json     // field positions, types, roles — populated by AI auto-placement or manual edit. Each field now also carries documentIndex (0 = this pdfStorageKey, 1+ = additionalDocuments[documentIndex-1]) — see FieldDefinition in lib/signing/field-types.ts. Existing rows have no documentIndex on their fields, which is read as 0 everywhere that consumes it, so old data needs no backfill.
+  folderId      String?
+  folder        TemplateFolder? @relation(fields: [folderId], references: [id])
+  aiDrafted     Boolean  @default(false) // set when the AI assistant generated this document's content from scratch
+  aiReviewedAt  DateTime? // required before an aiDrafted template can be used to send an envelope — see lib/signing/envelopes.ts's createEnvelope guard
+  selfServeEnabled Boolean @default(false) // when true, anyone with selfServeToken can fill their own name/email and start a new envelope on demand — see app/public/sign/[token]
+  selfServeToken   String? @unique
+  createdAt     DateTime @default(now())
+
+  envelopes Envelope[]
+  additionalDocuments TemplateDocument[] // documents 2+ — ordered by TemplateDocument.order, documentIndex = order + 1
+
+  @@index([tenantId, folderId])
+}
+
+// A document beyond the first on a multi-document template — see the
+// comment on Template.pdfStorageKey/fieldMap above for how these relate.
+// Its own table rather than a JSON array: each document needs its own
+// AI-autoplace pass and page count, and the existing single-document
+// editor (app/dashboard/templates/[id]/page.tsx) is reused as-is to edit
+// one of these via a ?doc= query param — it just needs a real row/id to
+// point at, not an array index that shifts if one gets deleted.
+// A tenant's saved recipients — auto-populated the first time someone new
+// is used on an envelope (see createEnvelope/createDraftEnvelope in
+// lib/signing/envelopes.ts), and selectable from a search/pick list on
+// future envelopes instead of retyping name+email. Scoped per-tenant, not
+// shared across tenants — this is each sender's own address book, not a
+// platform-wide directory.
+model Contact {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  name      String
+  email     String
+  createdAt DateTime @default(now())
+  lastUsedAt DateTime @default(now()) // bumped every time this contact is picked again — drives "recently used" ordering
+
+  @@unique([tenantId, email])
+  @@index([tenantId, lastUsedAt])
+}
+
+model TemplateDocument {
+  id            String   @id @default(cuid())
+  templateId    String
+  template      Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  name          String
+  pdfStorageKey String
+  fieldMap      Json     @default("[]") // same shape as Template.fieldMap — this document's own fields, edited independently
+  pageCount     Int
+  order         Int      // 0-indexed among additionalDocuments; documentIndex in signing/completion tracking = order + 1
+  createdAt     DateTime @default(now())
+
+  @@index([templateId, order])
+}
+
+model Envelope {
+  id                  String         @id @default(cuid())
+  tenantId            String
+  tenant              Tenant         @relation(fields: [tenantId], references: [id])
+  templateId          String
+  template            Template       @relation(fields: [templateId], references: [id])
+  status              EnvelopeStatus @default(draft)
+  externalRef         String?        // correlates to a record in the calling platform (e.g. Dvxel Qbank candidate id)
+  expiresAt           DateTime?
+  reminderAfterHoursOverride Int? // per-envelope custom reminder cadence — null means use the platform default (config.envelopes.reminderAfterHours)
+  legalHold           Boolean        @default(false) // when true, retention-purge skips this envelope even after the tenant requests full account deletion — see lib/billing/retention-purge.ts
+  signedPdfStorageKey String?        // set once finalizePdf() runs — the actual signed document, distinct from the unsigned template
+  createdAt           DateTime       @default(now())
+  completedAt         DateTime?
+  message             String?
+  fieldMap            Json?
+  updatedAt           DateTime @updatedAt
+
+  recipients  Recipient[]
+  auditEvents AuditEvent[]
+  certificate Certificate?
+  payments    EnvelopePayment[]
+
+  @@index([tenantId, externalRef])
+  @@index([status, expiresAt]) // used by expireOverdueEnvelopes() — see lib/signing/envelopes.ts
+}
+
+model Recipient {
+  id                   String        @id @default(cuid())
+  envelopeId           String
+  envelope             Envelope      @relation(fields: [envelopeId], references: [id])
+  name                 String
+  email                String
+  role                 RecipientRole @default(signer)
+  signingOrder         Int           @default(1)
+  status               String        @default("pending") // pending | delivered | opened | signed | declined
+  accessTokenHash      String        @unique // SHA-256, one-way — used to authenticate incoming signing requests, see lib/auth-style pattern
+  accessTokenEncrypted String?       // AES-256-GCM, reversible — used ONLY to resend the same link in reminder emails. Never used for auth checks. See lib/token-crypto.ts.
+  ipAddress            String?
+  geo                  Json?
+  signedAt             DateTime?
+  declineReason        String?
+  // Email OTP verification — an extra factor beyond possessing the link
+  // itself, so a stolen/forwarded link alone isn't enough to open the
+  // document. otpCodeHash is SHA-256 (not scrypt like passwords) since
+  // brute-force resistance here comes from otpAttempts + a short expiry,
+  // not hash cost — a 6-digit code has far less entropy than a password,
+  // so a slow hash wouldn't meaningfully add protection, just latency.
+  otpCodeHash          String?
+  otpExpiresAt         DateTime?
+  otpAttempts          Int           @default(0)
+  otpVerifiedAt        DateTime?     // set once verified; stays set for the rest of this recipient's access — not re-required on every visit
+  // Multi-document sequential signing — which document indexes (0 =
+  // primary Template.pdfStorageKey, 1+ = additionalDocuments[n-1], same
+  // numbering as everywhere else in this feature) this recipient has
+  // finished. `status` only flips to "signed" once this covers every
+  // document in the envelope — see completeRecipientDocument() in
+  // lib/signing/envelopes.ts. Empty array for a single-document envelope
+  // works the same as before: one document, one entry, done.
+  completedDocumentIndexes Int[] @default([])
+  // Field values submitted for documents that are done but where the
+  // envelope as a whole isn't finished yet — keyed by document index as
+  // a string (Prisma Json keys are always strings). Nothing gets burned
+  // into a PDF until every document is covered; this is what holds the
+  // earlier documents' values in the meantime. Cleared once the recipient
+  // finishes (see completeMultiDocumentSigning in lib/signing/envelopes.ts) —
+  // there's no reason to keep raw submitted values around after they're
+  // burned into the signed PDF and captured in the audit log.
+  pendingFieldValues Json @default("{}")
+
+  auditEvents AuditEvent[]
+  payments    EnvelopePayment[]
+}
+
+// Append-only. Never update or delete rows — only insert.
+model AuditEvent {
+  id          String     @id @default(cuid())
+  envelopeId  String
+  envelope    Envelope   @relation(fields: [envelopeId], references: [id])
+  recipientId String?
+  recipient   Recipient? @relation(fields: [recipientId], references: [id])
+  eventType   String     // sent | delivered | opened | field_filled | signed | declined | voided | expired | reminder_sent | email_failed | signing_validation_failed | finalization_failed | attachment_upload_failed
+  summary     String     @default("") // plain-English description generated at write time — what a super admin or compliance reviewer reads, not the raw eventType enum
+  ipAddress   String?
+  userAgent   String?
+  geo         Json?
+  timestamp   DateTime   @default(now())
+
+  @@index([envelopeId])
+  @@index([eventType])
+}
+
+model EnvelopePayment {
+  id                    String   @id @default(cuid())
+  envelopeId            String
+  envelope              Envelope @relation(fields: [envelopeId], references: [id])
+  recipientId           String
+  recipient             Recipient @relation(fields: [recipientId], references: [id])
+  fieldId                String   // the payment field's id within the template's fieldMap
+  stripeCheckoutSessionId String  @unique
+  amountCents           Int
+  currency              String
+  status                String   @default("pending") // pending | paid | failed | expired — set by app/api/webhooks/stripe-connect's checkout.session.completed handler, never by the client
+  createdAt             DateTime @default(now())
+  paidAt                DateTime?
+
+  @@index([envelopeId])
+}
+
+model Certificate {
+  id            String   @id @default(cuid())
+  envelopeId    String   @unique
+  envelope      Envelope @relation(fields: [envelopeId], references: [id])
+  pdfStorageKey String
+  webViewUrl    String?
+  generatedAt   DateTime @default(now())
+  // RFC 3161 trusted timestamp over the final signed PDF's SHA-256 digest
+  // — proves the document existed at this exact moment, independent of
+  // the signing certificate's own lifetime (see lib/signing/timestamp.ts's
+  // file header for the full reasoning). Stored as base64 of the raw DER
+  // TimeStampToken rather than surgically re-embedded into the PDF's own
+  // CMS signature structure — that embedding is the one part of the RFC
+  // 3161 code that's never been verified against a real TSA response (see
+  // timestamp.ts), so this keeps it as independently-verifiable evidence
+  // alongside the signature instead of risking malforming the signature
+  // itself. Null if the TSA call failed or hasn't been attempted —
+  // deliberately never blocks certificate generation either way.
+  timestampToken     String?
+  timestampObtainedAt DateTime?
+}
+
+// One row per real charge (or refund/failure) — the admin-side revenue
+// ledger and every tenant's own invoice history both read from this one
+// table. Created at the moment a charge event is applied (lib/billing/
+// apply-event.ts) so it's always in sync with what Stripe actually did,
+// never a separately-maintained running total that can drift.
+model Invoice {
+  id              String   @id @default(cuid())
+  invoiceNumber   Int      @unique @default(autoincrement()) // sequential, for real accounting/tax purposes — display as e.g. "INV-000123", never reuse or renumber
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  kind            String   // "subscription" | "credit_pack" | "trial_conversion" | "refund"
+  description     String   // human-readable line item, e.g. "Starter plan — monthly" or "50 extra envelopes"
+  subtotalCents   Int      // pre-tax amount
+  taxCents        Int      @default(0)
+  taxRatePercent  Float?   // the rate actually applied, captured at charge time — so a later change to Tenant.taxRatePercent never silently rewrites a past invoice's history
+  amountCents     Int      // subtotalCents + taxCents — the actual total charged (or, for a refund, the actual total returned)
+  currency        String   @default("usd")
+  status          String   // "paid" | "failed" — a refund is its own row (kind: "refund", negative amounts, linked via refundOfInvoiceId), never a mutation of the original charge's status, so the original stays an accurate record of what actually happened at the time
+  externalReference String?  // the payment provider's own reference for this charge (a checkout session id, subscription id, etc, whatever form the active provider uses) — provider-agnostic name on purpose, see Tenant.trialExternalCustomerId's comment
+  pdfStorageKey   String?  // set once the branded PDF is generated — see lib/billing/invoice-pdf.ts
+  emailedAt       DateTime?
+  refundOfInvoiceId String? // set on a "refund" kind row — points back at the original charge it reverses
+  refundOfInvoice   Invoice? @relation("InvoiceRefunds", fields: [refundOfInvoiceId], references: [id])
+  refunds           Invoice[] @relation("InvoiceRefunds")
+  createdAt       DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
+// A message a tenant sends directly to Upfinity — lands in the admin
+// dashboard, not a third-party helpdesk. Deliberately simple (no
+// threading UI, no rich ticket states) — this is a contact channel, not
+// a full support-ticket system; see the note on app/admin/messages for
+// what a "real" version of this would add later if volume ever justifies it.
+model SupportMessage {
+  id          String    @id @default(cuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id])
+  senderEmail String
+  subject     String
+  body        String
+  status      String    @default("open") // "open" | "resolved"
+  // "general" | "refund" — a refund request is filed as its own distinct
+  // category (with invoiceId set) rather than blending into the general
+  // queue, so it can't quietly sit unprioritized the way a message with no
+  // structured signal about its urgency can. Doesn't auto-approve
+  // anything — refundInvoice() (lib/billing/refund.ts) is still the only
+  // thing that actually issues money back, and still requires a platform
+  // admin to act. This makes the ASK itself impossible to lose track of.
+  category    String    @default("general")
+  invoiceId   String?
+  createdAt   DateTime  @default(now())
+  resolvedAt  DateTime?
+  resolvedByAdminId String?
+
+  @@index([status, createdAt])
+  @@index([category, status])
+}
+
+model UsageMeter {
+  id          String @id @default(cuid())
+  tenantId    String
+  tenant      Tenant @relation(fields: [tenantId], references: [id])
+  meteredItem String // envelopes_sent | id_verifications | sms_sent | api_calls | storage_gb
+  period      String // e.g. "2026-08"
+  quantity    Int    @default(0)
+
+  @@unique([tenantId, meteredItem, period])
+}
+
+// Fixed-window API rate limiting, DB-backed rather than in-memory — a
+// serverless deployment has no shared memory across instances, so an
+// in-process counter would silently under-count. See lib/rate-limit.ts.
+model RateLimitBucket {
+  id          String   @id @default(cuid())
+  tenantId    String
+  windowStart DateTime // truncated to the minute
+  count       Int      @default(0)
+
+  @@unique([tenantId, windowStart])
+}
+
+// Captures webhook deliveries that exhausted all retries, so failures are
+// visible/re-drivable instead of silently dropped. See lib/webhooks/dispatch.ts.
+model DeadLetterWebhook {
+  id         String   @id @default(cuid())
+  tenantId   String
+  payload    Json
+  lastError  String
+  attempts   Int
+  createdAt  DateTime @default(now())
+  resolvedAt DateTime?
+
+  @@index([tenantId, resolvedAt])
+}
+
+// SSO configuration, backed by a real Jackson SAML connection (lib/jackson.ts)
+// — clientID/clientSecret are Jackson's own, returned when the connection
+// is created. enabled flips true only once that connection is confirmed
+// created, not just when the form is submitted. See PRD §14.
+model SsoConfig {
+  id           String   @id @default(cuid())
+  tenantId     String   @unique
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  provider     String   @default("saml") // "saml" | "oidc"
+  jacksonClientId     String?
+  jacksonClientSecret String?
+  idpEntityId  String?
+  enabled      Boolean  @default(false)
+  createdAt    DateTime @default(now())
+}
+
+// Password reset tokens. Scoped to a specific TenantUser row (not just an
+// email) — since the same email can legitimately belong to TenantUser rows
+// in multiple tenants (someone consulting for two companies, same as the
+// login-disambiguation note in lib/tenant-auth.ts), a reset request must
+// specify which workspace, and the token is issued for that one row only.
+model PasswordResetToken {
+  id           String    @id @default(cuid())
+  tenantUserId String
+  tokenHash    String    @unique
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([tenantUserId])
+}
+
+model UsageCredit {
+  id         String   @id @default(cuid())
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id])
+  creditType String   // "envelopes" | "ai_messages" — extend as new metered/purchasable items are added
+  balance    Int      @default(0)
+  updatedAt  DateTime @updatedAt
+
+  @@unique([tenantId, creditType])
+}
+
+model Subscription {
+  id            String           @id @default(cuid())
+  tenantId      String           @unique
+  tenant        Tenant           @relation(fields: [tenantId], references: [id])
+  tier          SubscriptionTier @default(free)
+  addons        Json             @default("[]")
+  billingPeriod String           @default("monthly")
+  cardOnFile    Boolean          @default(false)
+  externalCustomerId String? // the payment provider's own customer reference — provider-agnostic name on purpose, see the note on Tenant.trialExternalCustomerId above. Captured on first subscribe; without this, a customer suspended by dunning has no stored reference to actually recover through — see lib/billing/dunning.ts
+  createdAt     DateTime         @default(now())
+}
