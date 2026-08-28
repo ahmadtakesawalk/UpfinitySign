@@ -79,7 +79,7 @@ class R2Adapter implements StorageAdapter {
     return Buffer.from(bytes);
   }
   url(key: string): string {
-    return `https://${process.env.R2_PUBLIC_DOMAIN}/${key}`;
+    return `https://${requireEnv("R2_PUBLIC_DOMAIN")}/${key}`;
   }
   async delete(key: string): Promise<void> {
     const { S3Client, DeleteObjectCommand } = await import("@aws-sdk/client-s3");
