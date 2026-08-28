@@ -27,9 +27,9 @@
 
   /* Recipient card — warm cream/brown instead of flat grey, for a more
      high-end feel on recipient rows in the envelope setup flow. */
-  --recipient-bg: #faf3ea;
-  --recipient-bg-hover: #f5ead9;
-  --recipient-border: #d9c2a0;
+  --recipient-bg: #f4f2ff;
+  --recipient-bg-hover: #ece7ff;
+  --recipient-border: #d5cbff;
   --recipient-accent: #8a5a2b;
 
   /* Scale */
