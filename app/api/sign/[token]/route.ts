@@ -1,3 +1,4 @@
+// DEPLOY TO: app/api/sign/[token]/route.ts
 // GET/POST /api/sign/:token — public, token-authenticated (no login).
 // This is what app/sign/[token]/page.tsx calls.
 
@@ -303,7 +304,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ tok
     // and tell the client which document to show next. No signature is
     // recorded, no envelope-completion check runs, nothing gets burned —
     // all of that only happens once every document is covered, below.
-    const pending = { ...(recipient.pendingFieldValues as Record<string, unknown>), [String(documentIndex)]: finalFields };
+    const pending = { ...(recipient.pendingFieldValues as unknown as Record<string, unknown>), [String(documentIndex)]: finalFields };
     await prisma.recipient.update({
       where: { id: recipient.id },
       data: { completedDocumentIndexes: newCompletedIndexes, pendingFieldValues: pending as any },
@@ -340,7 +341,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ tok
     // audit trail, leaving a signed-but-never-finalized envelope that no
     // one would know to go fix.
     try {
-      const pendingByIndex = recipient.pendingFieldValues as Record<string, FilledField[]>;
+      const pendingByIndex = recipient.pendingFieldValues as unknown as Record<string, FilledField[]>;
       const docsForBurn = await Promise.all(
         resolvedDocs.map(async (d, i) => ({
           pdfBytes: await storage.get(d.pdfStorageKey),
