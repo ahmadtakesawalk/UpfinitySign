@@ -25,6 +25,7 @@ interface TemplateSummary {
   fieldMap: unknown;
   aiDrafted?: boolean;
   aiReviewedAt?: string | null;
+  pdf_url?: string;
 }
 
 type RecipientRole = "signer" | "approver" | "cc";
@@ -122,6 +123,13 @@ function NewEnvelopeForm() {
   const [uploadName, setUploadName] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadedPdfUrl, setUploadedPdfUrl] = useState<string | null>(null);
+  // Matches the accordion pattern from the DocuSign reference this flow
+  // was built against (Add documents / Add recipients / Add message,
+  // collapsed until you reach them) — Recipients starts collapsed and
+  // opens once a document is actually selected, instead of always being
+  // fully expanded regardless of how far along you are.
+  const [recipientsOpen, setRecipientsOpen] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -135,6 +143,11 @@ function NewEnvelopeForm() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Recipients starts collapsed and stays that way until you open it
+  // yourself — it does NOT auto-open just because a template got selected
+  // (that auto-open was the bug: arriving via a "Use this template" link
+  // pre-fills templateId before the first render, so it looked permanently
+  // expanded no matter what).
   function updateRecipient(clientId: string, patch: Partial<RecipientRow>) {
     setRecipients((prev) => prev.map((r) => (r.clientId === clientId ? { ...r, ...patch } : r)));
   }
@@ -177,7 +190,9 @@ function NewEnvelopeForm() {
       setTemplates((prev) => [{ id: json.template_id, name: uploadName.trim(), fieldMap: json.field_map ?? [] }, ...prev]);
       setTemplateId(json.template_id);
       setTemplateSource("existing");
-      show({ message: "Document uploaded — fields were placed automatically. Review them anytime from Templates.", type: "success" });
+      setUploadedPdfUrl(json.pdf_url ?? null);
+      const fieldCount = (json.field_map ?? []).length;
+      show({ message: fieldCount > 0 ? `Document uploaded — ${fieldCount} field${fieldCount === 1 ? "" : "s"} placed automatically.` : "Document uploaded — no fields were auto-placed, add them manually before sending.", type: fieldCount > 0 ? "success" : "info" });
     } catch {
       setUploadError("Network error — please try again.");
     } finally {
@@ -316,10 +331,26 @@ function NewEnvelopeForm() {
                     {uploading ? "Uploading & placing fields…" : "Upload"}
                   </Button>
                   {templateId && templates.some((t) => t.id === templateId) && (
-                    <p style={{ fontSize: 12.5, color: "var(--success)", marginTop: 10 }}>
-                      ✓ Using "{templates.find((t) => t.id === templateId)?.name}" — continue below, or{" "}
-                      <a href={`/dashboard/templates/${templateId}`}>review its fields</a>.
-                    </p>
+                    <div style={{ marginTop: 12 }}>
+                      <p style={{ fontSize: 12.5, color: "var(--success)", marginBottom: 8 }}>
+                        ✓ Using "{templates.find((t) => t.id === templateId)?.name}"
+                      </p>
+                      {uploadedPdfUrl && (
+                        <iframe
+                          src={uploadedPdfUrl}
+                          title="Document preview"
+                          style={{ width: "100%", height: 320, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", marginBottom: 8 }}
+                        />
+                      )}
+                      <a href={`/dashboard/templates/${templateId}`} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
+                        <Button type="button" variant="secondary" style={{ width: "100%" }}>
+                          Review & place fields →
+                        </Button>
+                      </a>
+                      <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 6 }}>
+                        Opens in a new tab — your recipients below stay filled in.
+                      </p>
+                    </div>
                   )}
                 </div>
               ) : (
@@ -336,16 +367,53 @@ function NewEnvelopeForm() {
                       );
                     })}
                   </select>
+                  {templateId && (() => {
+                    const selected = templates.find((t) => t.id === templateId);
+                    if (!selected) return null;
+                    return (
+                      <div style={{ marginTop: 12 }}>
+                        {selected.pdf_url && (
+                          <iframe
+                            src={selected.pdf_url}
+                            title="Document preview"
+                            style={{ width: "100%", height: 320, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", marginBottom: 8 }}
+                          />
+                        )}
+                        <a href={`/dashboard/templates/${templateId}`} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
+                          <Button type="button" variant="secondary" style={{ width: "100%" }}>
+                            Review & edit fields →
+                          </Button>
+                        </a>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
             </Card>
 
             <Card style={{ marginBottom: 16 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                <h3>Recipients</h3>
-                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Signs in the order listed, top to bottom</span>
-              </div>
-              <p style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 16 }}>
+              <button
+                type="button"
+                onClick={() => setRecipientsOpen((o) => !o)}
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left" }}
+              >
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <h3 style={{ margin: 0 }}>Recipients</h3>
+                  {!recipientsOpen && recipients.some((r) => r.name.trim() || r.email.trim()) && (
+                    <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                      ({recipients.filter((r) => r.name.trim() || r.email.trim()).length} added)
+                    </span>
+                  )}
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)" }}>Signs in the order listed, top to bottom</span>
+                  <span style={{ display: "inline-block", transition: "transform var(--transition-fast) ease", transform: recipientsOpen ? "rotate(180deg)" : "rotate(0deg)" }}>▾</span>
+                </span>
+              </button>
+
+              {recipientsOpen && (
+                <>
+              <p style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 16, marginTop: 12 }}>
                 Add at least one recipient name and email address to continue.
               </p>
 
@@ -513,6 +581,8 @@ function NewEnvelopeForm() {
               >
                 + Add recipient
               </button>
+                </>
+              )}
             </Card>
 
             {templateId && (
