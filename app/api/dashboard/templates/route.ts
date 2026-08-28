@@ -102,7 +102,7 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    return NextResponse.json({ template_id: template.id }, { status: 201 });
+    return NextResponse.json({ template_id: template.id, pdf_url: storage.url(stored.key), field_map: proposedFields }, { status: 201 });
   } catch (err) {
     // This outer catch is the real fix here — storage.put() in particular
     // was completely unprotected, and misconfigured/missing storage
