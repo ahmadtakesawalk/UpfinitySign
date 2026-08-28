@@ -8,11 +8,11 @@
 // own "sent / pending / completed" view without polling single envelopes
 // one at a time — the same status/signed-pdf/certificate shape as
 // GET /api/v1/envelopes/:id, just as a paginated collection.
-
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateTenant, requireScope } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { storage } from "@/lib/storage";
+import { EnvelopeStatus, Prisma } from "@prisma/client";
 
 const PAGE_SIZE_DEFAULT = 25;
 const PAGE_SIZE_MAX = 100;
@@ -20,12 +20,19 @@ const PAGE_SIZE_MAX = 100;
 // Provider-facing status groups — collapses the underlying EnvelopeStatus
 // enum into the three buckets an integration actually wants to filter by,
 // rather than making every caller know our exact internal status names.
-const STATUS_GROUPS: Record<string, string[]> = {
-  pending: ["sent", "delivered", "opened", "signed"], // in-flight, not yet fully completed — "signed" covers a multi-recipient envelope where one has signed but others haven't
-  completed: ["completed"],
-  declined: ["declined"],
-  voided: ["voided"],
-  expired: ["expired"],
+// Typed as EnvelopeStatus[] (not string[]) so this can go straight into a
+// Prisma `status: { in: ... }` filter without a cast.
+const STATUS_GROUPS: Record<string, EnvelopeStatus[]> = {
+  pending: [
+    EnvelopeStatus.sent,
+    EnvelopeStatus.delivered,
+    EnvelopeStatus.opened,
+    EnvelopeStatus.signed,
+  ], // in-flight, not yet fully completed — "signed" covers a multi-recipient envelope where one has signed but others haven't
+  completed: [EnvelopeStatus.completed],
+  declined: [EnvelopeStatus.declined],
+  voided: [EnvelopeStatus.voided],
+  expired: [EnvelopeStatus.expired],
 };
 
 export async function GET(req: NextRequest) {
@@ -45,7 +52,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: `status must be one of: ${Object.keys(STATUS_GROUPS).join(", ")}` }, { status: 400 });
   }
 
-  const where = {
+  const where: Prisma.EnvelopeWhereInput = {
     tenantId: auth.tenant.id,
     ...(statusParam ? { status: { in: STATUS_GROUPS[statusParam] } } : {}),
     ...(externalRef ? { externalRef } : {}),
